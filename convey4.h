@@ -726,72 +726,11 @@ void c_string_set_used_length(c_string_t string, size_t used);
   SECTION 8 – printf / wprintf FORMAT HELPERS  (C11 _Generic)
 ==================================================================================*/
 
-/*
- * Format specifier for use with printf and C_str_arg():
- *   printf("Name: " C_STR_FMT "\n", C_str_arg(my_str));
- */
 #define C_STR_FMT   "%.*s"
 #define C_WSTR_FMT  L"%.*ls"
 
 /* ──────────────────────────────────────────────────────────────────────────────────
- * STANDARD (double-evaluation) MACROS
- *
- * WARNING: C_str_arg(X) evaluates X twice – once for the length and once for the
- * pointer.  Never pass a function call with side-effects here.  Use the
- * C_PRINTF_SAFE() macro for that.
- * ──────────────────────────────────────────────────────────────────────────────── */
-
-/**
- * Resolve to the integer character count of X, where X may be:
- *   - char * / const char *          (NUL-terminated C string)
- *   - uint8_t * / const uint8_t *    (convey string)
- *   - c_slice_t / c_utf8_slice_t     (byte-view slices)
- *
- * c_utf16_slice_t is intentionally omitted: use C_wstr_arg on Windows or
- * c_string_print_utf16() for cross-platform output of UTF-16 text.
- */
-#define C_str_len(X) _Generic((X),                                         \
-    char *:           (int)strlen((const char *)(X)),                      \
-    const char *:     (int)strlen((const char *)(X)),                      \
-    uint8_t *:        (int)c_string_get_used_length((const uint8_t *)(X)), \
-    const uint8_t *:  (int)c_string_get_used_length((const uint8_t *)(X)), \
-    c_slice_t:        (int)(X).length,                                     \
-    c_utf8_slice_t:   (int)(X).length                                      \
-)
-
-/**
- * Resolve to a `const char *` suitable for use with `%.*s`.
- * Returns "" for NULL pointers and NULL slice data (never returns NULL itself).
- */
-#define C_str_ptr(X) _Generic((X),                                              \
-    char *:           ((X) ? (const char *)(X) : ""),                           \
-    const char *:     ((X) ? (const char *)(X) : ""),                           \
-    uint8_t *:        ((X) ? (const char *)(X) : ""),                           \
-    const uint8_t *:  ((X) ? (const char *)(X) : ""),                           \
-    c_slice_t:        ((X).data ? (const char *)(X).data : ""),                 \
-    c_utf8_slice_t:   ((X).data ? (const char *)(X).data : "")                  \
-)
-
-/**
- * Expand to the two printf arguments required by C_STR_FMT ("%.*s"):
- * the integer length followed by the char pointer.
- *
- * Usage:
- *   printf("Hello " C_STR_FMT "!\n", C_str_arg(my_str));
- *   printf("A=" C_STR_FMT " B=" C_STR_FMT "\n", C_str_arg(a), C_str_arg(b));
- *
- * Accepts: c_string_t, c_const_string_t, c_slice_t, c_utf8_slice_t, char *.
- *
- * WARNING: evaluates X twice.  Assign function results to a variable first.
- */
-#define C_str_arg(X)  C_str_len(X), C_str_ptr(X)
-
-/* ──────────────────────────────────────────────────────────────────────────────────
- * SAFE (single-evaluation) STATEMENT MACROS
- *
- * These evaluate the expression exactly once, making them safe for function calls
- * that mutate or allocate.  The trade-off is that they cannot be mixed with other
- * printf arguments in the same call – they are standalone print statements.
+ * INTERNAL HELPERS & DISPATCHER
  * ──────────────────────────────────────────────────────────────────────────────── */
 
 /* Internal helper struct – do not use directly. */
@@ -821,15 +760,18 @@ static inline c_str_fmt_arg_t _c_fmt_utf8_slice(c_utf8_slice_t s) {
     c_utf8_slice_t:   _c_fmt_utf8_slice                  \
 )(X)
 
-/**
- * Single-evaluation printf statement.  Safe to use with mutating function calls.
- *
- * Usage:
- *   C_PRINTF_SAFE("Trimmed: " C_STR_FMT "\n", c_string_trim(my_str));
- *
- * Limitation: cannot be mixed with additional format arguments.
- * For mixed output, store the result in a variable and use C_str_arg().
- */
+/* ──────────────────────────────────────────────────────────────────────────────────
+ * STANDARD (double-evaluation) MACROS
+ * ──────────────────────────────────────────────────────────────────────────────── */
+
+#define C_str_len(X)  (C_FMT_ARG(X).len)
+#define C_str_ptr(X)  (C_FMT_ARG(X).ptr)
+#define C_str_arg(X)  C_str_len(X), C_str_ptr(X)
+
+/* ──────────────────────────────────────────────────────────────────────────────────
+ * SAFE (single-evaluation) STATEMENT MACROS
+ * ──────────────────────────────────────────────────────────────────────────────── */
+
 #define C_PRINTF_SAFE(fmt, expr)                     \
     do {                                             \
         c_str_fmt_arg_t _csa_tmp = C_FMT_ARG(expr); \
@@ -838,40 +780,8 @@ static inline c_str_fmt_arg_t _c_fmt_utf8_slice(c_utf8_slice_t s) {
 
 /* ──────────────────────────────────────────────────────────────────────────────────
  * UTF-16 PRINTF EQUIVALENTS  (Windows / wchar_t targets only)
- * Active when wchar_t is 16 bits (Windows) or _WIN32 is defined.
  * ──────────────────────────────────────────────────────────────────────────────── */
 #if WCHAR_MAX == 0xFFFFu || defined(_WIN32)
-
-/**
- * Resolve to the wchar_t character count of a UTF-16 string or slice.
- * The length is derived from the byte length divided by 2 (each code unit is 2 bytes).
- */
-#define C_wstr_len(X) _Generic((X),                                                          \
-    uint8_t *:        (int)(c_string_get_used_length((const uint8_t *)(X)) / 2u),            \
-    const uint8_t *:  (int)(c_string_get_used_length((const uint8_t *)(X)) / 2u),            \
-    c_utf16_slice_t:  (int)((X).length / 2u)                                                 \
-)
-
-/**
- * Resolve to a `const wchar_t *` suitable for use with `%.*ls`.
- * Returns L"" for NULL pointers (never returns NULL itself).
- */
-#define C_wstr_ptr(X) _Generic((X),                                              \
-    uint8_t *:        ((X) ? (const wchar_t *)(X) : L""),                        \
-    const uint8_t *:  ((X) ? (const wchar_t *)(X) : L""),                        \
-    c_utf16_slice_t:  ((X).data ? (const wchar_t *)(X).data : L"")               \
-)
-
-/**
- * Expand to the two wprintf arguments required by C_WSTR_FMT (L"%.*ls"):
- * the integer code-unit count followed by the wchar_t pointer.
- *
- * Usage:
- *   wprintf(L"Name: " C_WSTR_FMT L"\n", C_wstr_arg(my_utf16_str));
- *
- * WARNING: evaluates X twice.  Assign function results first.
- */
-#define C_wstr_arg(X)  C_wstr_len(X), C_wstr_ptr(X)
 
 /* Internal helper struct for safe UTF-16 print – do not use directly. */
 typedef struct { int len; const wchar_t *ptr; } c_wstr_fmt_arg_t;
@@ -896,12 +806,10 @@ static inline c_wstr_fmt_arg_t _c_wfmt_utf16_slice(c_utf16_slice_t s) {
     c_utf16_slice_t:  _c_wfmt_utf16_slice            \
 )(X)
 
-/**
- * Single-evaluation wprintf statement for UTF-16 strings.
- *
- * Usage:
- *   C_WPRINTF_SAFE(L"Name: " C_WSTR_FMT L"\n", c_string_trim(my_utf16_str));
- */
+#define C_wstr_len(X)  (C_WFMT_ARG(X).len)
+#define C_wstr_ptr(X)  (C_WFMT_ARG(X).ptr)
+#define C_wstr_arg(X)  C_wstr_len(X), C_wstr_ptr(X)
+
 #define C_WPRINTF_SAFE(fmt, expr)                      \
     do {                                               \
         c_wstr_fmt_arg_t _cwsa_tmp = C_WFMT_ARG(expr);\
@@ -909,7 +817,6 @@ static inline c_wstr_fmt_arg_t _c_wfmt_utf16_slice(c_utf16_slice_t s) {
     } while (0)
 
 #endif /* WCHAR_MAX == 0xFFFF || _WIN32 */
-
 /*==================================================================================
   SECTION 9 – SLICE COMPOUND-LITERAL HELPERS
   All of these use c_string_get_used_length(), which is declared in Section 5.
