@@ -5,12 +5,624 @@
  *
  * DEPENDENCIES
  *   utf8proc.h  – UTF-8 processing, normalisation, codepoint iteration
- *   <stdlib.h>  – malloc / realloc / free
- *   <string.h>  – memcpy / memmove / memcmp / strlen
- *   <stdint.h>  – uint8_t, uint16_t, uint32_t, uint64_t, SIZE_MAX
- *   <stdbool.h> – bool
- *   <wchar.h>   – wchar_t (UTF-16 print helpers on Windows)
+ *   <stdlib.h>  – malloc / realloc / #pragma once
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <limits.h>   /* INT_MAX */
+#include <stdio.h>
+#include <string.h>
+#include <SDL3/SDL.h>
+#include "utf8proc.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*══════════════════════════════════════════════════════════════════════════════
+  ALIGNMENT / PACKING SWITCH
+  Uncomment for older or embedded hardware that cannot handle misaligned reads.
+  Dynamic strings can cause heavy memory fragmentation on embedded systems;
+  consider SDL_SetMemoryFunctions with an arena or pool allocator.
+══════════════════════════════════════════════════════════════════════════════*/
+
+//#define b_ALIGNED
+
+/*══════════════════════════════════════════════════════════════════════════════
+  TYPE-FLAGS BIT LAYOUT  (one byte, lives immediately before the data pointer)
+
+    Bit 0    – Memory layout     B_STRING_PACK_MASK   0x01
+    Bit 1    – Allocation policy B_STRING_STATIC_MASK 0x02
+    Bits 2-3 – Header size class B_STR_TYPE_MASK      0x0C
+    Bits 4-6 – Encoding tag      B_STR_ENC_MASK       0x70
+    Bit 7    – reserved / 0
+
+══════════════════════════════════════════════════════════════════════════════*/
+
+/* --- Memory Layout (Bit 0) --- */
+#define B_STRING_PACKED      0x00u  /* 0000 0000 – packed structs  (default)  */
+#define B_STRING_ALIGNED     0x01u  /* 0000 0001 – aligned structs w/ padding */
+#define B_STRING_PACK_MASK   0x01u
+
+/* --- Allocation Strategy (Bit 1) --- */
+#define B_STRING_DYNAMIC     0x00u  /* 0000 0000 – dynamically resizing       */
+#define B_STRING_STATIC      0x02u  /* 0000 0010 – fixed-capacity heap buffer */
+#define B_STRING_STATIC_MASK 0x02u
+
+/*
+ * NOTE on "static" strings:  despite the name, static b_str_t objects are
+ * still heap-allocated via SDL_malloc.  The flag means the *capacity* is
+ * fixed – b_str_ensure() will never reallocate them.  You can still
+ * b_str_free() a static string normally.
+ */
+
+/* Convenience alias */
+#define B_STR_STATIC  B_STRING_STATIC
+
+/* --- Header Size Class (Bits 2-3) --- */
+#define B_STR_TYPE_8         0x00u  /* 0000 0000 – used/cap stored as uint8_t  */
+#define B_STR_TYPE_16        0x04u  /* 0000 0100 – used/cap stored as uint16_t */
+#define B_STR_TYPE_32        0x08u  /* 0000 1000 – used/cap stored as uint32_t */
+#define B_STR_TYPE_64        0x0Cu  /* 0000 1100 – used/cap stored as uint64_t */
+#define B_STR_TYPE_MASK      0x0Cu
+
+/* --- Encoding Tag (Bits 4-6) --- */
+#define B_STR_ENC_ASCII      0x00u  /* 0000 0000 – ASCII (7-bit)               */
+#define B_STR_ENC_UTF8       0x10u  /* 0001 0000 – UTF-8                       */
+#define B_STR_ENC_UTF16BE    0x20u  /* 0010 0000 – UTF-16 Big-Endian           */
+#define B_STR_ENC_UTF16LE    0x30u  /* 0011 0000 – UTF-16 Little-Endian        */
+#define B_STR_ENC_UTF32BE    0x40u  /* 0100 0000 – UTF-32 Big-Endian           */
+#define B_STR_ENC_UTF32LE    0x50u  /* 0101 0000 – UTF-32 Little-Endian        */
+#define B_STR_ENC_UTF16      B_STR_ENC_UTF16LE  /* alias – LE is default UTF-16 */
+#define B_STR_ENC_UTF32      B_STR_ENC_UTF32LE  /* alias – LE is default UTF-32 */
+#define B_STR_ENC_MASK       0x70u
+
+/*
+ * Encoding family testers.
+ * The argument must already be masked with B_STR_ENC_MASK (or be a raw
+ * flags byte; the extra bits are harmless because the masks isolate bits
+ * 5-6 only).
  *
+ * UTF-16 encodings occupy the range 0x20..0x3F (bits 5-6 == 01).
+ * UTF-32 encodings occupy the range 0x40..0x5F (bits 5-6 == 10).
+ */
+#define B_STR_IS_UTF16_ENC(encoding) (((encoding) & 0x60u) == 0x20u)
+#define B_STR_IS_UTF32_ENC(encoding) (((encoding) & 0x60u) == 0x40u)
+
+#define B_STR_ONE_MEG  1048576u
+
+/*══════════════════════════════════════════════════════════════════════════════
+  HEADER STRUCTS
+  Under b_ALIGNED the structs carry explicit padding so every field lands on
+  its natural boundary and the flags byte is always the last byte of the
+  header.  Under packed mode the structs are __packed__ / pragma pack(1) with
+  no gaps.  In both cases s[-1] is always the flags byte and B_HDR*(s) gives
+  the corresponding header pointer.
+
+  Header sizes (packed / aligned):
+    b_string_header_8  –  3 bytes  /  3 bytes
+    b_string_header_16 –  5 bytes  /  6 bytes
+    b_string_header_32 –  9 bytes  / 12 bytes
+    b_string_header_64 – 17 bytes  / 24 bytes
+══════════════════════════════════════════════════════════════════════════════*/
+
+#ifdef b_ALIGNED
+
+typedef struct b_string_header_8 {
+    uint8_t  capacity;
+    uint8_t  length;
+    uint8_t  flags;
+    uint8_t  data[];
+} b_hdr8_t;
+
+typedef struct b_string_header_16 {
+    uint16_t capacity;
+    uint16_t length;
+    uint8_t  _padding;  /* 1 byte – brings header to 6 bytes */
+    uint8_t  flags;
+    uint8_t  data[];
+} b_hdr16_t;
+
+typedef struct b_string_header_32 {
+    uint32_t capacity;
+    uint32_t length;
+    uint8_t  _padding[3]; /* 3 bytes – brings header to 12 bytes */
+    uint8_t  flags;
+    uint8_t  data[];
+} b_hdr32_t;
+
+typedef struct b_string_header_64 {
+    uint64_t capacity;
+    uint64_t length;
+    uint8_t  _padding[7]; /* 7 bytes – brings header to 24 bytes */
+    uint8_t  flags;
+    uint8_t  data[];
+    /* NOTE: on 32-bit embedded hardware you are unlikely to reach this class */
+} b_hdr64_t;
+
+#else  /* packed (default) */
+
+#if defined(_MSC_VER)
+#  pragma pack(push, 1)
+#  define B_STR_PACKED_ATTR
+#elif defined(__GNUC__) || defined(__clang__)
+#  define B_STR_PACKED_ATTR __attribute__((__packed__))
+#else
+#  define B_STR_PACKED_ATTR
+#endif
+
+typedef struct B_STR_PACKED_ATTR b_string_header_8  { uint8_t  capacity; uint8_t  length; uint8_t flags; uint8_t data[]; } b_hdr8_t;
+typedef struct B_STR_PACKED_ATTR b_string_header_16 { uint16_t capacity; uint16_t length; uint8_t flags; uint8_t data[]; } b_hdr16_t;
+typedef struct B_STR_PACKED_ATTR b_string_header_32 { uint32_t capacity; uint32_t length; uint8_t flags; uint8_t data[]; } b_hdr32_t;
+typedef struct B_STR_PACKED_ATTR b_string_header_64 { uint64_t capacity; uint64_t length; uint8_t flags; uint8_t data[]; } b_hdr64_t;
+
+#if defined(_MSC_VER)
+#  pragma pack(pop)
+#endif
+
+#endif /* b_ALIGNED */
+
+/*
+ * Backward-compatible type aliases (so existing code using the old bare names
+ * b_hdr8 / b_hdr16 / b_hdr32 / b_hdr64 keeps compiling).
+ */
+typedef b_hdr8_t  b_hdr8;
+typedef b_hdr16_t b_hdr16;
+typedef b_hdr32_t b_hdr32;
+typedef b_hdr64_t b_hdr64;
+
+/* Mutable header access – cast backwards from the data pointer. */
+#define B_HDR8(p)   ((b_hdr8_t *) ((p) - sizeof(b_hdr8_t)))
+#define B_HDR16(p)  ((b_hdr16_t*)((p) - sizeof(b_hdr16_t)))
+#define B_HDR32(p)  ((b_hdr32_t*)((p) - sizeof(b_hdr32_t)))
+#define B_HDR64(p)  ((b_hdr64_t*)((p) - sizeof(b_hdr64_t)))
+
+/* Const header access */
+#define B_CHDR8(p)  ((const b_hdr8_t *) ((p) - sizeof(b_hdr8_t)))
+#define B_CHDR16(p) ((const b_hdr16_t*)((p) - sizeof(b_hdr16_t)))
+#define B_CHDR32(p) ((const b_hdr32_t*)((p) - sizeof(b_hdr32_t)))
+#define B_CHDR64(p) ((const b_hdr64_t*)((p) - sizeof(b_hdr64_t)))
+
+/*══════════════════════════════════════════════════════════════════════════════
+  CORE TYPES
+══════════════════════════════════════════════════════════════════════════════*/
+
+typedef uint8_t*       b_str_t;
+typedef const uint8_t* b_cstr_t;
+
+/*
+ * Slice types – a (pointer, byte-length) pair, NOT null-terminated.
+ * b_slice_t and b_u8slice_t are byte-level views (ASCII or UTF-8).
+ * b_u16slice_t  – UTF-16 view; len is always a multiple of 2.
+ * b_u32slice_t  – UTF-32 view; len is always a multiple of 4.
+ */
+typedef struct b_byte_slice   { const uint8_t *data; size_t len; } b_slice_t;
+typedef struct b_utf8_slice   { const uint8_t *data; size_t len; } b_u8slice_t;
+typedef struct b_utf16_slice  { const uint8_t *data; size_t len; } b_u16slice_t;
+typedef struct b_utf32_slice  { const uint8_t *data; size_t len; } b_u32slice_t;
+
+/*══════════════════════════════════════════════════════════════════════════════
+  CORE ACCESSORS
+══════════════════════════════════════════════════════════════════════════════*/
+
+size_t  b_str_hdr_size (uint8_t flags);
+uint8_t b_str_pick_type(size_t  byte_size);
+uint8_t b_str_enc      (b_cstr_t s);
+void    b_str_set_enc  (b_str_t  s, uint8_t encoding);
+size_t  b_str_len      (b_cstr_t s);
+size_t  b_str_cap      (b_cstr_t s);
+size_t  b_str_avail    (b_cstr_t s);
+void    b_str_set_lens (b_str_t  s, size_t used_bytes, size_t capacity_bytes);
+void    b_str_set_len  (b_str_t  s, size_t used_bytes);
+size_t  b_str_cpcount  (b_cstr_t s);
+
+/*══════════════════════════════════════════════════════════════════════════════
+  LIFECYCLE
+══════════════════════════════════════════════════════════════════════════════*/
+
+b_str_t b_str_new           (const char *cstr);
+b_str_t b_str_new_pro       (const void *data, size_t byte_len, uint8_t encoding);
+b_str_t b_str_new_static    (const char *cstr, size_t extra_bytes);
+b_str_t b_str_new_static_pro(const void *data, size_t byte_len,
+                              size_t total_capacity, uint8_t encoding);
+void    b_str_free          (b_str_t s);
+b_str_t b_str_dup           (b_cstr_t s);
+void    b_str_clear         (b_str_t s);
+bool    b_str_empty         (b_cstr_t s);
+b_str_t b_str_to_dyn        (b_str_t s);
+
+/*══════════════════════════════════════════════════════════════════════════════
+  SLICE CONSTRUCTORS
+══════════════════════════════════════════════════════════════════════════════*/
+
+b_str_t b_str_from_slice   (b_slice_t    slice);
+b_str_t b_str_from_u8slice (b_u8slice_t  slice);
+b_str_t b_str_from_u16slice(b_u16slice_t slice);
+b_str_t b_str_from_u16     (const uint16_t *units, size_t unit_count);
+b_str_t b_str_from_u32slice(b_u32slice_t slice);
+b_str_t b_str_from_u32     (const uint32_t *units, size_t unit_count);
+
+/*══════════════════════════════════════════════════════════════════════════════
+  APPENDING & CONCATENATION
+══════════════════════════════════════════════════════════════════════════════*/
+
+b_str_t b_str_append    (b_str_t s, const char *cstr);
+b_str_t b_str_append_pro(b_str_t s, const void *data, size_t byte_len);
+b_str_t b_str_append_sl (b_str_t s, b_slice_t    slice);
+b_str_t b_str_append_u8 (b_str_t s, b_u8slice_t  slice);
+b_str_t b_str_append_u16(b_str_t s, b_u16slice_t slice);
+b_str_t b_str_append_u32(b_str_t s, b_u32slice_t slice);
+b_str_t b_str_concat    (b_cstr_t a, b_cstr_t b);
+
+/*══════════════════════════════════════════════════════════════════════════════
+  CAPACITY MANAGEMENT
+══════════════════════════════════════════════════════════════════════════════*/
+
+b_str_t b_str_ensure (b_str_t s, size_t extra_bytes);
+b_str_t b_str_reserve(b_str_t s, size_t extra_bytes);
+b_str_t b_str_fit    (b_str_t s);
+void    b_str_arr_fit(b_str_t *array, size_t count);
+
+/*══════════════════════════════════════════════════════════════════════════════
+  SLICE EXTRACTORS
+══════════════════════════════════════════════════════════════════════════════*/
+
+b_slice_t    b_slice_of          (b_cstr_t s);
+b_slice_t    b_subslice          (b_cstr_t s, size_t byte_offset, size_t byte_len);
+b_slice_t    b_subslice_cp       (b_cstr_t s, size_t codepoint_offset,
+                                              size_t codepoint_count);
+
+b_u8slice_t  b_u8slice_of        (b_cstr_t s);
+b_u8slice_t  b_u8subslice        (b_cstr_t s, size_t byte_offset, size_t byte_len);
+b_u8slice_t  b_u8subslice_cp     (b_cstr_t s, size_t codepoint_offset,
+                                               size_t codepoint_count);
+
+b_u16slice_t b_u16slice_of       (b_cstr_t s);
+b_u16slice_t b_u16subslice       (b_cstr_t s, size_t byte_offset, size_t byte_len);
+b_u16slice_t b_u16subslice_cp    (b_cstr_t s, size_t codepoint_offset,
+                                               size_t codepoint_count);
+size_t       b_u16slice_units    (b_u16slice_t slice);
+
+b_u32slice_t b_u32slice_of       (b_cstr_t s);
+b_u32slice_t b_u32subslice       (b_cstr_t s, size_t byte_offset, size_t byte_len);
+b_u32slice_t b_u32subslice_cp    (b_cstr_t s, size_t codepoint_offset,
+                                               size_t codepoint_count);
+size_t       b_u32slice_units    (b_u32slice_t slice);
+
+/*══════════════════════════════════════════════════════════════════════════════
+  ENCODING CONVERTERS
+  String converters NEVER prepend a BOM; call b_str_add_bom(s) explicitly.
+  Each converter accepts any b_str encoding as input and routes through
+  UTF-8 as the common intermediate when a direct path isn't available.
+══════════════════════════════════════════════════════════════════════════════*/
+
+b_str_t b_str_utf8_norm (const char *null_terminated_utf8); /* NFC-normalise   */
+b_str_t b_str_to_utf16  (b_cstr_t s);  /* any  ->  UTF-16 LE (system default)  */
+b_str_t b_str_to_utf16be(b_cstr_t s);  /* any  ->  UTF-16 BE                   */
+b_str_t b_str_to_utf32le(b_cstr_t s);  /* any  ->  UTF-32 LE                   */
+b_str_t b_str_to_utf32be(b_cstr_t s);  /* any  ->  UTF-32 BE                   */
+b_str_t b_str_to_utf8   (b_cstr_t s);  /* any  ->  UTF-8                       */
+
+/*══════════════════════════════════════════════════════════════════════════════
+  CASE CONVERSION
+  Only UTF-8 and ASCII are supported.  UTF-16 and UTF-32 strings return NULL.
+
+  b_str_lower  – Unicode case-folding via utf8proc_decompose_char.
+                 The result is NFC-recomposed per UTF8PROC_COMPOSE.
+                 Produces the Unicode "case-fold" normal form (suitable for
+                 case-insensitive comparison), which may differ slightly from
+                 locale-specific lowercase.
+
+  b_str_upper  – Simple uppercase via utf8proc_toupper (per-codepoint mapping).
+                 Unlike b_str_lower this does NOT decompose/recompose, so some
+                 multi-codepoint uppercase mappings are not applied.  Both
+                 functions are intentionally asymmetric: the utf8proc API
+                 exposes a rich casefold path but only a simple toupper.
+══════════════════════════════════════════════════════════════════════════════*/
+
+b_str_t b_str_lower(b_cstr_t s);
+b_str_t b_str_upper(b_cstr_t s);
+
+/*══════════════════════════════════════════════════════════════════════════════
+  COMPARISON & SEARCH
+  All comparisons are byte-level (memcmp).  For Unicode-aware ordering,
+  normalise both strings first with b_str_utf8_norm.
+══════════════════════════════════════════════════════════════════════════════*/
+
+int    b_str_cmp        (b_cstr_t a, b_cstr_t b);
+bool   b_str_eq         (b_cstr_t a, b_cstr_t b);
+size_t b_str_find       (b_cstr_t haystack, b_cstr_t needle);
+bool   b_str_contains   (b_cstr_t s, b_cstr_t needle);
+bool   b_str_starts_with(b_cstr_t s, b_cstr_t prefix);
+bool   b_str_ends_with  (b_cstr_t s, b_cstr_t suffix);
+
+/*══════════════════════════════════════════════════════════════════════════════
+  IN-PLACE MUTATION
+══════════════════════════════════════════════════════════════════════════════*/
+
+b_str_t b_str_trim_r(b_str_t s);
+b_str_t b_str_trim_l(b_str_t s);
+b_str_t b_str_trim  (b_str_t s);
+b_str_t b_str_repeat(b_cstr_t s, size_t repeat_count);
+
+/*══════════════════════════════════════════════════════════════════════════════
+  VALIDATION
+══════════════════════════════════════════════════════════════════════════════*/
+
+bool b_str_valid_utf8(b_cstr_t s);
+
+/*══════════════════════════════════════════════════════════════════════════════
+  BOM
+══════════════════════════════════════════════════════════════════════════════*/
+
+/*
+ * b_str_detect_bom
+ *
+ *   Inspect the leading bytes of `data` for a UTF-8, UTF-16 LE/BE, or
+ *   UTF-32 LE/BE byte-order mark.  Sets *bom_size_out to the BOM byte length
+ *   (2–4) or to 0 when none is found.  bom_size_out may be NULL.
+ *   Returns the matching B_STR_ENC_* tag, or B_STR_ENC_ASCII when absent.
+ *
+ *   Detection order (most-specific first to avoid ambiguity):
+ *     UTF-32 BE  : 00 00 FE FF  (4 bytes)
+ *     UTF-32 LE  : FF FE 00 00  (4 bytes, checked before UTF-16 LE)
+ *     UTF-8      : EF BB BF     (3 bytes)
+ *     UTF-16 LE  : FF FE        (2 bytes)
+ *     UTF-16 BE  : FE FF        (2 bytes)
+ */
+uint8_t b_str_detect_bom(const void *data, size_t byte_len, size_t *bom_size_out);
+
+/*
+ * b_str_add_bom
+ *
+ *   Prepend the correct BOM for the string's own encoding tag.
+ *   The caller MUST reassign:  s = b_str_add_bom(s);
+ *   ASCII strings are returned unchanged (no BOM for ASCII).
+ */
+b_str_t b_str_add_bom(b_str_t s);
+
+/*══════════════════════════════════════════════════════════════════════════════
+  FILE I/O – PRIMITIVES
+══════════════════════════════════════════════════════════════════════════════*/
+
+/*
+ * b_str_load_file
+ *   Read an entire file into a new b_str_t.  BOM (if any) is stripped and used
+ *   to set the encoding tag.  fallback_encoding is used when no BOM is found
+ *   (pass 0 to default to B_STR_ENC_UTF8).  Returns NULL on failure.
+ */
+b_str_t b_str_load_file(const char *path, uint8_t fallback_encoding);
+
+/*
+ * b_str_save_file
+ *   Write s to a file.  When write_bom is true the appropriate BOM is written
+ *   first; ASCII strings produce no BOM.  Returns 0 on success, -1 on failure.
+ */
+int b_str_save_file(const char *path, b_cstr_t s, bool write_bom);
+
+/*
+ * b_file_add_bom
+ *   Prepend the correct BOM for the given encoding to the file at path.
+ *   If the file already begins with that exact BOM it is left untouched.
+ *   Returns 0 on success, -1 on failure.
+ */
+int b_file_add_bom(const char *path, uint8_t encoding);
+
+/*══════════════════════════════════════════════════════════════════════════════
+  FILE CONVERSION WRAPPERS
+  _b_file_convert() is internal (not exported).  Use the named wrappers below.
+
+  Naming convention:
+    b_file_conv_{input_enc}[_no_bom_in]_to_{output_enc}[_bom|_no_bom]
+
+  Input:  BOM is always auto-detected.  The encoding constant passed as the
+          second argument to _b_file_convert is only used as a *fallback* when
+          no BOM is found.
+  Output: "_bom" appends the BOM for the output encoding; "_no_bom" does not.
+          When neither suffix appears a BOM IS written (the most common need).
+══════════════════════════════════════════════════════════════════════════════*/
+
+/* ASCII  ->  UTF-8 */
+int b_file_conv_ascii_to_utf8_bom    (const char *in_path, const char *out_path);
+int b_file_conv_ascii_to_utf8_no_bom (const char *in_path, const char *out_path);
+
+/* UTF-8  ->  UTF-16 */
+int b_file_conv_utf8_to_utf16                 (const char *in_path, const char *out_path); /* system endian + BOM */
+int b_file_conv_utf8_to_utf16le_bom           (const char *in_path, const char *out_path);
+int b_file_conv_utf8_to_utf16le_no_bom        (const char *in_path, const char *out_path);
+int b_file_conv_utf8_to_utf16be_bom           (const char *in_path, const char *out_path);
+int b_file_conv_utf8_to_utf16be_no_bom        (const char *in_path, const char *out_path);
+
+/* UTF-8  ->  UTF-32 */
+int b_file_conv_utf8_to_utf32                 (const char *in_path, const char *out_path); /* system endian + BOM */
+int b_file_conv_utf8_to_utf32le_bom           (const char *in_path, const char *out_path);
+int b_file_conv_utf8_to_utf32le_no_bom        (const char *in_path, const char *out_path);
+int b_file_conv_utf8_to_utf32be_bom           (const char *in_path, const char *out_path);
+int b_file_conv_utf8_to_utf32be_no_bom        (const char *in_path, const char *out_path);
+
+/* UTF-16  ->  UTF-8 */
+int b_file_conv_utf16_to_utf8_no_bom          (const char *in_path, const char *out_path); /* auto-detect; fallback LE */
+int b_file_conv_utf16le_bom_to_utf8_no_bom    (const char *in_path, const char *out_path);
+int b_file_conv_utf16le_no_bom_to_utf8_bom    (const char *in_path, const char *out_path);
+int b_file_conv_utf16le_no_bom_to_utf8_no_bom (const char *in_path, const char *out_path);
+int b_file_conv_utf16be_bom_to_utf8_no_bom    (const char *in_path, const char *out_path);
+int b_file_conv_utf16be_no_bom_to_utf8_bom    (const char *in_path, const char *out_path);
+int b_file_conv_utf16be_no_bom_to_utf8_no_bom (const char *in_path, const char *out_path);
+
+/* UTF-32  ->  UTF-8 */
+int b_file_conv_utf32_to_utf8_no_bom          (const char *in_path, const char *out_path); /* auto-detect; fallback LE */
+int b_file_conv_utf32le_bom_to_utf8_no_bom    (const char *in_path, const char *out_path);
+int b_file_conv_utf32le_no_bom_to_utf8_bom    (const char *in_path, const char *out_path);
+int b_file_conv_utf32le_no_bom_to_utf8_no_bom (const char *in_path, const char *out_path);
+int b_file_conv_utf32be_bom_to_utf8_no_bom    (const char *in_path, const char *out_path);
+int b_file_conv_utf32be_no_bom_to_utf8_bom    (const char *in_path, const char *out_path);
+int b_file_conv_utf32be_no_bom_to_utf8_no_bom (const char *in_path, const char *out_path);
+
+/*══════════════════════════════════════════════════════════════════════════════
+  UTF-16 STDOUT HELPER
+══════════════════════════════════════════════════════════════════════════════*/
+
+/*
+ * b_str_print_utf16 – convert a UTF-16 slice to UTF-8 and write to stdout.
+ * Exists because printf("%.*s") cannot print UTF-16 data directly.
+ */
+void b_str_print_utf16(b_u16slice_t slice);
+
+/*══════════════════════════════════════════════════════════════════════════════
+  PROPERTY MACROS
+══════════════════════════════════════════════════════════════════════════════*/
+
+#define B_STR_IS_STATIC_S(s)  (((s) != NULL) && (((s)[-1] & B_STRING_STATIC_MASK) != 0u))
+#define B_STR_IS_ALIGNED_S(s) (((s) != NULL) && (((s)[-1] & B_STRING_PACK_MASK)   != 0u))
+
+/*
+ * B_STR_NULL_SIZE – null-terminator width in bytes for the given encoding tag.
+ *   ASCII / UTF-8 → 1 byte
+ *   UTF-16        → 2 bytes
+ *   UTF-32        → 4 bytes
+ */
+#define B_STR_NULL_SIZE(encoding) \
+    (B_STR_IS_UTF32_ENC(encoding) ? 4u : B_STR_IS_UTF16_ENC(encoding) ? 2u : 1u)
+
+#define B_STR_ENC_OF(s)       b_str_enc(s)
+#define B_STR_IS_ASCII(s)     (b_str_enc(s) == B_STR_ENC_ASCII)
+#define B_STR_IS_UTF8(s)      (b_str_enc(s) == B_STR_ENC_UTF8)
+#define B_STR_IS_UTF16LE(s)   (b_str_enc(s) == B_STR_ENC_UTF16LE)
+#define B_STR_IS_UTF16BE(s)   (b_str_enc(s) == B_STR_ENC_UTF16BE)
+#define B_STR_IS_UTF16(s)     (B_STR_IS_UTF16_ENC(b_str_enc(s)))
+#define B_STR_IS_UTF32LE(s)   (b_str_enc(s) == B_STR_ENC_UTF32LE)
+#define B_STR_IS_UTF32BE(s)   (b_str_enc(s) == B_STR_ENC_UTF32BE)
+#define B_STR_IS_UTF32(s)     (B_STR_IS_UTF32_ENC(b_str_enc(s)))
+#define B_STR_IS_BYTE_ENC(s)  (!B_STR_IS_UTF16(s) && !B_STR_IS_UTF32(s))
+
+/* Cast helpers for direct uint16_t/uint32_t iteration */
+#define B_STR_AS_U16(s)       ((const uint16_t*)(s))
+#define B_STR_AS_U32(s)       ((const uint32_t*)(s))
+
+/*══════════════════════════════════════════════════════════════════════════════
+  SLICE HELPERS
+══════════════════════════════════════════════════════════════════════════════*/
+
+#define B_SLICE_OF(s)         ((b_slice_t)   {(s), b_str_len(s)})
+#define B_U8SLICE_OF(s)       ((b_u8slice_t) {(s), b_str_len(s)})
+#define B_U16SLICE_OF(s)      ((b_u16slice_t){(s), b_str_len(s)})
+#define B_U32SLICE_OF(s)      ((b_u32slice_t){(s), b_str_len(s)})
+#define B_SUBSLICE(s,o,l)     b_subslice((s),(o),(l))
+#define B_SUBSLICE_CP(s,o,c)  b_subslice_cp((s),(o),(c))
+
+/*══════════════════════════════════════════════════════════════════════════════
+  PRINTF FORMAT HELPERS  (C11 _Generic)
+
+  B_STR_FMT   – format token to use in a printf format string: "%.*s"
+  B_FMT_ARG   – produce a b_fmt_arg_t from a string/slice/cstr expression.
+                 Supported types: char*, const char*, uint8_t*, const uint8_t*,
+                 b_slice_t, b_u8slice_t.
+  B_str_len   – extract the (int) byte count from any of the above types.
+  B_str_ptr   – extract the (const char*) data pointer from any of the above.
+
+  BUG WARNING – B_str_arg(X) evaluates X twice.
+                Do NOT use it with expressions that have side effects (function
+                calls, post-increment, etc.).  Prefer B_PRINTF_SAFE for those.
+
+  SAFE VARIANT – B_PRINTF_SAFE(fmt, expr) evaluates expr exactly once.
+                 The format string must include "%.*s" (or more generally must
+                 consume an int precision and a const char*).  Example:
+                   B_PRINTF_SAFE("key=%.*s\n", my_b_str);
+══════════════════════════════════════════════════════════════════════════════*/
+
+#define B_STR_FMT  "%.*s"
+
+/*
+ * b_fmt_arg_t – (len, ptr) pair produced by the _Generic helper functions.
+ * len is clamped to INT_MAX so that "%.*s" never receives a negative precision.
+ */
+typedef struct b_printf_format_argument {
+    int         len;
+    const char *ptr;
+} b_fmt_arg_t;
+
+/* --- Internal helper functions (not for direct use) --- */
+
+static inline b_fmt_arg_t _b_fmt_cstr(const char *s) {
+    size_t raw_len = s ? strlen(s) : 0;
+    return (b_fmt_arg_t){
+        (raw_len > (size_t)INT_MAX) ? INT_MAX : (int)raw_len,
+        s ? s : ""
+    };
+}
+
+static inline b_fmt_arg_t _b_fmt_str(const uint8_t *s) {
+    /* b_str_len handles NULL safely, returning 0. */
+    size_t raw_len = b_str_len(s);
+    return (b_fmt_arg_t){
+        (raw_len > (size_t)INT_MAX) ? INT_MAX : (int)raw_len,
+        s ? (const char*)s : ""
+    };
+}
+
+static inline b_fmt_arg_t _b_fmt_sl(b_slice_t slice) {
+    return (b_fmt_arg_t){
+        (slice.len > (size_t)INT_MAX) ? INT_MAX : (int)slice.len,
+        slice.data ? (const char*)slice.data : ""
+    };
+}
+
+static inline b_fmt_arg_t _b_fmt_u8sl(b_u8slice_t slice) {
+    return (b_fmt_arg_t){
+        (slice.len > (size_t)INT_MAX) ? INT_MAX : (int)slice.len,
+        slice.data ? (const char*)slice.data : ""
+    };
+}
+
+/* --- Public _Generic dispatcher --- */
+
+#define B_FMT_ARG(X) _Generic((X),             \
+    char*:          _b_fmt_cstr,                \
+    const char*:    _b_fmt_cstr,                \
+    uint8_t*:       _b_fmt_str,                 \
+    const uint8_t*: _b_fmt_str,                 \
+    b_slice_t:      _b_fmt_sl,                  \
+    b_u8slice_t:    _b_fmt_u8sl                 \
+)(X)
+
+/*
+ * B_str_len / B_str_ptr – extract a single field.
+ *
+ * WARNING: each macro call evaluates X once; if you need BOTH len and ptr
+ * (i.e., B_str_arg), X is evaluated TWICE.  Use B_PRINTF_SAFE instead when
+ * X has side effects.
+ */
+#define B_str_len(X)  (B_FMT_ARG(X).len)
+#define B_str_ptr(X)  (B_FMT_ARG(X).ptr)
+
+/*
+ * B_str_arg(X) – expands to "len, ptr" for use inside printf(...).
+ *
+ * DOUBLE-EVALUATION: X is evaluated twice.
+ * Safe for simple variable references; avoid complex expressions.
+ */
+#define B_str_arg(X)  B_str_len(X), B_str_ptr(X)
+
+/*
+ * B_PRINTF_SAFE – the only macro that evaluates expr exactly once.
+ * Use this whenever expr is not a simple variable.
+ *
+ * The caller is responsible for ensuring the format string contains "%.*s"
+ * at the position that consumes the (int, const char*) pair.  No compile-
+ * time check is performed.
+ *
+ * Example:
+ *   B_PRINTF_SAFE("result: " B_STR_FMT "\n", compute_string());
+ */
+#define B_PRINTF_SAFE(fmt, expr)                          \
+    do {                                                  \
+        b_fmt_arg_t _b_safe_arg_ = B_FMT_ARG(expr);      \
+        printf((fmt), _b_safe_arg_.len, _b_safe_arg_.ptr);\
+    } while (0)
+
+#ifdef __cplusplus
+}
+#endif
  * ── MEMORY LAYOUT ──────────────────────────────────────────────────────────────────
  *
  *   Each allocation looks like this in memory:
