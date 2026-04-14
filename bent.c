@@ -5,7 +5,6 @@
 #  define SSIZE_MAX ((size_t)(~(size_t)0) >> 1)
 #endif
 
-
 //  BOM byte sequences  (file-scope constants; used in BOM and file I/O sections)
 
 static const uint8_t BOM_UTF8[3]    = { 0xEFu, 0xBBu, 0xBFu };
