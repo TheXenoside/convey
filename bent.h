@@ -225,9 +225,6 @@ b_u32slice_t b_u32subslice_cp(b_cstr_t string, size_t codepoint_offset, size_t c
 size_t       b_u32slice_units(b_u32slice_t slice);  // byte_length / 4
 
 
-// 
-//  ENCODING CONVERTERS
-// 
 
 // On failure: return string unchanged (never NULL when string != NULL).
 // STATIC  input: result written back in-place when it fits; pointer stays valid.
@@ -244,19 +241,11 @@ b_str_t b_str_to_utf32le(b_str_t string);   // → UTF-32 LE
 b_str_t b_str_to_utf32be(b_str_t string);   // → UTF-32 BE
 
 
-// 
-//  CASE CONVERSION
-// 
-
 // UTF-8 and ASCII only. UTF-16/32 strings are returned unchanged (silent fail).
 // Same ownership contract as encoding converters above.
 b_str_t b_str_lower(b_str_t string);
 b_str_t b_str_upper(b_str_t string);
 
-
-// 
-//  COMPARISON & SEARCH
-// 
 
 // All comparisons are byte-level. NFC-normalise before calling for correct
 // Unicode ordering (e.g. two strings that look identical may differ in bytes
@@ -277,9 +266,6 @@ bool   b_str_starts_with(b_cstr_t string, b_cstr_t prefix);
 bool   b_str_ends_with  (b_cstr_t string, b_cstr_t suffix);
 
 
-// 
-//  IN-PLACE MUTATION
-// 
 
 // All return string. NULL in → NULL out.
 b_str_t b_str_trim_r(b_str_t string);  // strip trailing whitespace
@@ -290,18 +276,12 @@ b_str_t b_str_trim  (b_str_t string);  // strip both ends
 b_str_t b_str_repeat(b_cstr_t string, size_t repeat_count);
 
 
-// 
-//  VALIDATION
-// 
 
 // b_str_valid_utf8 – returns true if every byte sequence is valid UTF-8.
 // NULL is considered valid (empty string).
 bool b_str_valid_utf8(b_cstr_t string);
 
 
-// 
-//  BOM  (byte-order mark)
-// 
 
 // b_str_detect_bom – inspect raw bytes, return encoding tag and BOM size.
 // bom_size_out may be NULL. Returns B_STR_ENC_ASCII when no BOM is found.
@@ -313,12 +293,6 @@ uint8_t b_str_detect_bom(const void *data, size_t byte_length, size_t *bom_size_
 b_str_t b_str_add_bom(b_str_t string);
 
 
-// 
-//  FILE I/O  (synchronous, SDL IOStream)
-//
-//  All file I/O is done exclusively through SDL_IOFromFile / SDL_GetIOSize /
-//  SDL_ReadIO / SDL_WriteIO / SDL_CloseIO — no fopen/fread/fclose anywhere.
-// 
 
 // b_str_load_file – read an entire file into a new b_str_t.
 // BOM detection is automatic: if a BOM is found, its encoding takes precedence
@@ -338,15 +312,6 @@ int b_str_save_file(const char *path, b_cstr_t string, bool write_bom);
 int b_file_add_bom(const char *path, uint8_t encoding);
 
 
-// 
-//  FILE I/O  (asynchronous, SDL AsyncIO)
-//
-//  Typical async-load workflow:
-//    1. b_str_load_file_async(path, queue, userdata)   – queue the read
-//    2. SDL_WaitAsyncIOResult(queue, &outcome, -1)     – wait (or poll)
-//    3. b_str_from_async_result(&outcome, fallback)    – build the b_str_t
-//    4. SDL_free(outcome.buffer)                       – release SDL's buffer
-// 
 
 // b_str_load_file_async – queue an async file load via SDL_LoadFileAsync.
 // Returns true if the task was successfully queued, false on error.
@@ -361,14 +326,6 @@ bool b_str_load_file_async(const char *path, SDL_AsyncIOQueue *queue, void *user
 b_str_t b_str_from_async_result(const SDL_AsyncIOOutcome *outcome, uint8_t fallback_encoding);
 
 
-// 
-//  FILE CONVERSION  (read in one encoding, write in another)
-//
-//  b_file_convert is the single generic entry point.
-//  All the named b_file_conv_* wrappers below are thin aliases for it;
-//  they exist only as a convenience so you don't have to spell out the
-//  encoding constants yourself.
-// 
 
 // b_file_convert – convert a file from one encoding to another.
 //
@@ -755,7 +712,6 @@ typedef b_hdr16_t b_hdr16;
 typedef b_hdr32_t b_hdr32;
 typedef b_hdr64_t b_hdr64;
 
-// ─── Header pointer macros ────────────────────────────────────────────────────
 // Given a data pointer data_pointer (= the b_str_t value), recover the header struct.
 
 // Mutable access:
@@ -770,7 +726,6 @@ typedef b_hdr64_t b_hdr64;
 #define B_CHDR32(data_pointer) ((const b_hdr32_t *)((data_pointer) - sizeof(b_hdr32_t)))
 #define B_CHDR64(data_pointer) ((const b_hdr64_t *)((data_pointer) - sizeof(b_hdr64_t)))
 
-// ─── Internal alignment flag ──────────────────────────────────────────────────
 // Selected at compile time based on whether b_ALIGNED is defined.
 #ifdef b_ALIGNED
 #  define B_STR_ALIGN_FLAG B_STRING_ALIGNED
